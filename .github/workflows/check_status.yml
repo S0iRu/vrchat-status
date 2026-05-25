@@ -1,0 +1,41 @@
+name: VRChat Status Check
+
+on:
+  schedule:
+    # 5分ごとに実行
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # 手動実行も可能
+
+jobs:
+  check-status:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore state
+        uses: actions/cache@v4
+        with:
+          path: state.json
+          key: vrchat-status-state
+
+      - name: Run status check
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          STATE_FILE: state.json
+        run: python main.py
+
+      - name: Save state
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: vrchat-status-state
