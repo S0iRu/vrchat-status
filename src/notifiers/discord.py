@@ -72,7 +72,7 @@ def _build_embed(event: dict) -> dict:
         "color": color,
         "fields": fields,
         "url": incident.get("shortlink", "https://status.vrchat.com"),
-        "footer": {"text": "VRChat Status Monitor"},
+        "footer": {"text": "VRChat Status Monitor (GitHub Actions)"},
     }
 
     return embed
