@@ -145,6 +145,13 @@ function regionLabel(name) {
   return REGION_LABELS[name.trim().toLowerCase()] || name;
 }
 
+function formatUtc(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
+}
+
 // 段落単位で辞書・テンプレートを照合。一致しなければ null
 function translateParagraph(paragraph) {
   const collapsed = paragraph.trim().replace(/\s+/g, " ");
@@ -260,7 +267,8 @@ async function buildStatusPageEmbed(payload, env) {
   if (affectedComponents.length > 0) {
     const names = affectedComponents
       .map((c) => {
-        const nameJa = COMPONENT_NAME_LABELS[c.name] || c.name;
+        // Unicode 正規化(NFC)で é 等の合成差異による不一致を防ぐ
+        const nameJa = COMPONENT_NAME_LABELS[(c.name || "").normalize("NFC")] || c.name;
         const statusJa = c.status ? COMPONENT_STATUS_LABELS[c.status] || c.status : "";
         return statusJa ? `${nameJa} - ${statusJa}` : nameJa;
       })
@@ -268,16 +276,28 @@ async function buildStatusPageEmbed(payload, env) {
     fields.push({ name: "影響コンポーネント", value: names, inline: false });
   }
 
-  const timeSource = latestUpdate?.created_at || incident.updated_at;
-  if (timeSource) {
-    const unix = Math.floor(Date.parse(timeSource) / 1000);
-    if (Number.isFinite(unix)) {
-      // Discord タイムスタンプ記法: 閲覧者のタイムゾーン(JST等)・言語で自動表示
-      fields.push({ name: "更新時刻", value: `<t:${unix}:f> (<t:${unix}:R>)`, inline: false });
+  // メンテナンスの予定時間帯(scheduled_for / scheduled_until はメンテナンス時のみ含まれる)
+  // Discord タイムスタンプ記法: 閲覧者のタイムゾーン(JST等)・言語で自動表示
+  if (incident.scheduled_for) {
+    const start = Math.floor(Date.parse(incident.scheduled_for) / 1000);
+    const end = incident.scheduled_until ? Math.floor(Date.parse(incident.scheduled_until) / 1000) : NaN;
+    if (Number.isFinite(start)) {
+      const range = Number.isFinite(end) ? `<t:${start}:f> 〜 <t:${end}:f>` : `<t:${start}:f>`;
+      fields.push({ name: "メンテナンス予定時間", value: `${range}\n(<t:${start}:R>)`, inline: false });
     }
   }
 
   const originalLines = [`**${incident.name}**`, `Status: ${status} / Impact: ${impact}`];
+  if (affectedComponents.length > 0) {
+    const componentList = affectedComponents
+      .map((c) => (c.status ? `${c.name} (${c.status})` : c.name))
+      .join(", ");
+    originalLines.push(`Components: ${componentList}`);
+  }
+  if (incident.scheduled_for) {
+    const until = incident.scheduled_until ? ` - ${formatUtc(incident.scheduled_until)}` : "";
+    originalLines.push(`Scheduled: ${formatUtc(incident.scheduled_for)}${until} UTC`);
+  }
   if (latestBody) {
     originalLines.push(
       latestBody
@@ -290,6 +310,12 @@ async function buildStatusPageEmbed(payload, env) {
   if (original.length > 1024) {
     original = original.slice(0, 1021) + "...";
   }
+  // 日本語エリアと原文エリアの視覚的な区切り("\u200b" は不可視文字)
+  fields.push({
+    name: "\u200b",
+    value: "🔗 [VRChat ステータスページ](https://status.vrchat.com/)\n──────────────────",
+    inline: false,
+  });
   fields.push({ name: "以下原文", value: original, inline: false });
 
   return {
