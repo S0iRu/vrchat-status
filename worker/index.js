@@ -1,8 +1,3 @@
-const VRCHAT_CONFIG_URL = "https://api.vrchat.cloud/api/1/config";
-const HEALTH_CHECK_TIMEOUT_MS = 10000;
-const SLOW_THRESHOLD_MS = 5000;
-const CONSECUTIVE_FAILURES_BEFORE_ALERT = 2;
-
 export default {
   async fetch(request, env) {
     if (request.method !== "POST") {
@@ -11,7 +6,7 @@ export default {
 
     try {
       const payload = await request.json();
-      const embed = buildStatusPageEmbed(payload);
+      const embed = await buildStatusPageEmbed(payload, env);
 
       if (!embed) {
         return new Response("No actionable event", { status: 200 });
@@ -25,162 +20,195 @@ export default {
       return new Response("Internal error", { status: 500 });
     }
   },
-
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(performHealthCheck(env));
-  },
 };
 
-async function performHealthCheck(env) {
-  const result = await checkVRChatAPI();
-  const previousState = await env.KV.get("health_state", { type: "json" }) || {
-    status: "up",
-    consecutive_failures: 0,
-  };
+// --- Statuspage Webhook 用 ---
 
-  const currentStatus = determineStatus(result);
-  const shouldNotify = shouldSendNotification(previousState, currentStatus, result);
+const IMPACT_COLORS = {
+  none: 0x2ecc71,
+  minor: 0xf1c40f,
+  major: 0xe67e22,
+  critical: 0xe74c3c,
+  maintenance: 0x3498db,
+};
 
-  if (shouldNotify) {
-    const embed = buildHealthEmbed(currentStatus, result, previousState.status);
-    await sendToDiscord(env.DISCORD_WEBHOOK_URL, { embeds: [embed] });
-  }
+const STATUS_LABELS = {
+  investigating: "調査中",
+  identified: "原因特定",
+  monitoring: "経過観察中",
+  resolved: "解決済み",
+  postmortem: "事後分析",
+  scheduled: "メンテナンス予定",
+  in_progress: "メンテナンス実施中",
+  verifying: "完了確認中",
+  completed: "メンテナンス完了",
+};
 
-  const newState = {
-    status: currentStatus,
-    consecutive_failures: currentStatus === "up" ? 0 : (previousState.consecutive_failures || 0) + 1,
-    last_check: new Date().toISOString(),
-    last_status_code: result.statusCode,
-    last_response_ms: result.responseMs,
-  };
+const IMPACT_LABELS = {
+  none: "なし",
+  minor: "軽微",
+  major: "重大",
+  critical: "致命的",
+  maintenance: "メンテナンス",
+};
 
-  await env.KV.put("health_state", JSON.stringify(newState));
+const COMPONENT_STATUS_LABELS = {
+  operational: "稼働中",
+  degraded_performance: "性能低下",
+  partial_outage: "部分障害",
+  major_outage: "重大障害",
+  under_maintenance: "メンテナンス中",
+};
+
+const COMPONENT_NAME_LABELS = {
+  "API / Website": "API / ウェブサイト",
+  "Authentication / Login": "認証 / ログイン",
+  "Social / Friends List": "ソーシャル / フレンドリスト",
+  "SDK Asset Uploads": "SDKアセットアップロード",
+  "Realtime Player State Changes": "リアルタイムプレイヤー状態更新",
+  "Realtime Networking": "リアルタイムネットワーキング",
+  "USA, West (San José)": "USW(米国西部・サンノゼ)",
+  "USA, East (Washington D.C.)": "USE(米国東部・ワシントンD.C.)",
+  "Europe (Amsterdam)": "EU(欧州・アムステルダム)",
+  "Japan (Tokyo)": "JP(日本・東京)",
+};
+
+// 本文中のリージョン言及の表記揺れ → 統一表示(キーは小文字)
+const REGION_LABELS = {
+  "us west": "USW(米国西部・サンノゼ)",
+  "us-west": "USW(米国西部・サンノゼ)",
+  "usw": "USW(米国西部・サンノゼ)",
+  "usa, west (san josé)": "USW(米国西部・サンノゼ)",
+  "us east": "USE(米国東部・ワシントンD.C.)",
+  "us-east": "USE(米国東部・ワシントンD.C.)",
+  "use": "USE(米国東部・ワシントンD.C.)",
+  "usa, east (washington d.c.)": "USE(米国東部・ワシントンD.C.)",
+  "eu": "EU(欧州・アムステルダム)",
+  "europe": "EU(欧州・アムステルダム)",
+  "europe (amsterdam)": "EU(欧州・アムステルダム)",
+  "japan": "JP(日本・東京)",
+  "jp": "JP(日本・東京)",
+  "japan (tokyo)": "JP(日本・東京)",
+};
+
+// Statuspage 標準定型文 + VRChat 常用フレーズ(過去インシデントで2回以上使用)
+// キーは normalizeText() で正規化して照合する
+const BODY_PHRASES = [
+  // Statuspage 標準(障害系)
+  ["We are currently investigating this issue.", "現在この問題を調査しています。"],
+  ["The issue has been identified and a fix is being implemented.", "原因を特定し、修正対応を進めています。"],
+  ["A fix has been implemented and we are monitoring the results.", "修正を適用し、経過を観察しています。"],
+  ["We are continuing to investigate this issue.", "引き続きこの問題を調査しています。"],
+  ["We are continuing to work on a fix for this issue.", "引き続き修正対応を進めています。"],
+  ["We are continuing to monitor for any further issues.", "引き続き経過を観察しています。"],
+  ["This incident has been resolved.", "この障害は解決されました。"],
+  // Statuspage 標準(メンテナンス系)
+  ["We will be undergoing scheduled maintenance during this time.", "この時間帯に定期メンテナンスを実施します。"],
+  ["Scheduled maintenance is currently in progress. We will provide updates as necessary.", "定期メンテナンスを実施中です。必要に応じて更新情報をお知らせします。"],
+  ["We are verifying that the maintenance was completed successfully.", "メンテナンスが正常に完了したことを確認しています。"],
+  ["The scheduled maintenance has been completed.", "定期メンテナンスは完了しました。"],
+  // VRChat 常用フレーズ
+  ["We're observing logins return to normal levels", "ログインが通常水準に戻りつつあることを確認しています。"],
+  ["We're seeing api errors and latency returning to normal levels. We'll continue to monitor to ensure things remain stable.", "APIのエラーとレイテンシが通常水準に戻りつつあります。安定が続くか引き続き監視します。"],
+  ["We're aware of and are investigating increased latency and error rates of our API systems.", "APIシステムのレイテンシ増加とエラー率上昇を認識しており、調査中です。"],
+  ["Network connectivity appears to be stabilized. We are monitoring the situation.", "ネットワーク接続は安定したようです。状況を監視しています。"],
+  ["Login functionality is working again, we're continuing to monitor the stability of our upstream provider.", "ログイン機能は復旧しました。引き続き上流プロバイダーの安定性を監視します。"],
+  ["We are monitoring network connectivity issues with our servers. Upstream providers have been contacted.", "サーバーのネットワーク接続問題を監視しています。上流プロバイダーには連絡済みです。"],
+  ["Performance is returning to normal, we're continuing to monitor to ensure things remain stable.", "パフォーマンスは通常に戻りつつあります。安定が続くか引き続き監視します。"],
+  ["Performance of API systems have returned to normal. We're continuing to monitor to ensure things remain stable.", "APIシステムのパフォーマンスは通常に戻りました。安定が続くか引き続き監視します。"],
+  ["Our upstream provider has rolled out changes that should improve network connectivity across our real-time networking infrastructure. We'll keep monitoring the situation to quickly address any further issues.", "上流プロバイダーがリアルタイムネットワーク基盤の接続性を改善する変更を展開しました。さらなる問題に迅速に対応できるよう監視を続けます。"],
+  ["We're aware of and are monitoring performance and stability issues of our API systems caused by issues with an upstream provider.", "上流プロバイダーの問題に起因するAPIシステムのパフォーマンス・安定性の問題を認識しており、監視しています。"],
+  ["Connection times appear to have returned to normal, we will be continuing to monitor the situation.", "接続時間は通常に戻ったようです。引き続き状況を監視します。"],
+  ["We are aware and are investigating login issues caused by an outage at one of our upstream providers.", "上流プロバイダーの障害によるログイン問題を認識しており、調査中です。"],
+  ["We're currently investigating an increase in errors and latency with our API", "現在、APIのエラーとレイテンシの増加を調査しています。"],
+  ["We're aware of and are monitoring performance and stability issues of our API systems caused by an upstream provider performing maintenance at this time.", "上流プロバイダーが実施中のメンテナンスに起因するAPIシステムのパフォーマンス・安定性の問題を認識しており、監視しています。"],
+  ["We're currently observing issues with logging in to VRChat", "現在、VRChatへのログインに問題が発生していることを確認しています。"],
+  ["We're seeing our systems recover and are monitoring to ensure they remain stable", "システムの回復を確認しており、安定が続くか監視しています。"],
+  ["We're seeing an increase in latency and errors from our API, currently investigating", "APIのレイテンシ増加とエラーを確認しており、現在調査中です。"],
+  ["We've identified the issue and are working to fix it", "問題の原因を特定し、修正に取り組んでいます。"],
+  ["We've stabilized our systems and are seeing things recover. Will continue monitoring", "システムは安定し、回復傾向にあります。引き続き監視を行います。"],
+  // リージョン障害テンプレートの後続定型段落
+  ["Other regions appear to be unaffected by this issue, for the time being you may temporarily want to choose a different region during instance creation while we're investigating this incident with our provider.", "他のリージョンには影響がないようです。プロバイダーと調査を進める間、当面はインスタンス作成時に別のリージョンを選択することをご検討ください。"],
+];
+
+const BODY_PHRASE_MAP = new Map(BODY_PHRASES.map(([en, ja]) => [normalizeText(en), ja]));
+
+// リージョン名だけが変わる頻出テンプレート文
+const REGION_TEMPLATE_RE =
+  /^we're observing upstream provider network connectivity issues with our realtime servers which may result in timeouts and degraded performance across instances(?: hosted in (?:the )?(.+?)(?: region)?)?\.?$/i;
+
+function normalizeText(text) {
+  return text.trim().replace(/\s+/g, " ").replace(/[.!]+$/, "").toLowerCase();
 }
 
-async function checkVRChatAPI() {
-  const start = Date.now();
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);
+function regionLabel(name) {
+  return REGION_LABELS[name.trim().toLowerCase()] || name;
+}
+
+// 段落単位で辞書・テンプレートを照合。一致しなければ null
+function translateParagraph(paragraph) {
+  const collapsed = paragraph.trim().replace(/\s+/g, " ");
+
+  const hit = BODY_PHRASE_MAP.get(normalizeText(collapsed));
+  if (hit) return hit;
+
+  const m = collapsed.match(REGION_TEMPLATE_RE);
+  if (m) {
+    if (m[1]) {
+      return `上流プロバイダーのネットワーク接続問題により、${regionLabel(m[1])}リージョンのインスタンスでタイムアウトやパフォーマンス低下が発生する可能性があります。`;
+    }
+    return "上流プロバイダーのネットワーク接続問題により、インスタンスでタイムアウトやパフォーマンス低下が発生する可能性があります。";
+  }
+
+  return null;
+}
+
+async function translateWithAI(text, env) {
+  if (!env || !env.AI) return null;
 
   try {
-    const resp = await fetch(VRCHAT_CONFIG_URL, { signal: controller.signal });
-    clearTimeout(timeout);
-    const elapsed = Date.now() - start;
+    const result = await env.AI.run("@cf/google/gemma-3-12b-it", {
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a professional translator. Translate the user's text from English to natural Japanese. Output only the Japanese translation, with no explanations, notes, or quotation marks.",
+        },
+        { role: "user", content: text },
+      ],
+      max_tokens: 1024,
+    });
 
-    return {
-      success: true,
-      statusCode: resp.status,
-      responseMs: elapsed,
-      error: null,
-    };
+    const output = (result?.response || "").trim();
+    if (!output) return null;
+    // 異常出力ガード(翻訳として長すぎる場合は採用しない)
+    if (output.length > text.length * 3 + 100) return null;
+    return output;
   } catch (err) {
-    clearTimeout(timeout);
-    const elapsed = Date.now() - start;
-
-    let errorType = "UNKNOWN_ERROR";
-    if (err.name === "AbortError") {
-      errorType = "TIMEOUT";
-    } else if (err.message?.includes("DNS")) {
-      errorType = "DNS_FAILURE";
-    } else if (err.message?.includes("connect")) {
-      errorType = "CONNECTION_REFUSED";
-    } else if (err.message?.includes("TLS") || err.message?.includes("SSL")) {
-      errorType = "TLS_ERROR";
-    }
-
-    return {
-      success: false,
-      statusCode: null,
-      responseMs: elapsed,
-      error: errorType,
-    };
+    console.error("AI translation error:", err);
+    return null;
   }
 }
 
-function determineStatus(result) {
-  if (!result.success) return "down";
-  if (result.statusCode !== 200) return "down";
-  if (result.responseMs > SLOW_THRESHOLD_MS) return "degraded";
-  return "up";
+// 本文の日本語化: 全段落が辞書・テンプレートに一致すれば辞書訳、
+// 一致しなければ AI 翻訳(末尾に「(自動機械翻訳)」)、それも不可なら英語原文
+async function translateBody(body, env) {
+  if (!body) return "";
+
+  const paragraphs = body.trim().split(/\n\s*\n/);
+  const translated = paragraphs.map(translateParagraph);
+
+  if (translated.every((t) => t !== null)) {
+    return translated.join("\n\n");
+  }
+
+  const ai = await translateWithAI(body, env);
+  if (ai) return `${ai}(自動機械翻訳)`;
+
+  return body;
 }
 
-function shouldSendNotification(previousState, currentStatus, result) {
-  const prevStatus = previousState.status;
-  const failures = previousState.consecutive_failures || 0;
-
-  if (currentStatus === "up" && prevStatus !== "up") {
-    return true;
-  }
-
-  if (currentStatus === "down" && prevStatus === "up") {
-    return true;
-  }
-  if (currentStatus === "down" && prevStatus === "down" && failures === CONSECUTIVE_FAILURES_BEFORE_ALERT - 1) {
-    return false;
-  }
-
-  if (currentStatus === "degraded" && prevStatus === "up") {
-    return true;
-  }
-  if (currentStatus === "up" && prevStatus === "degraded") {
-    return true;
-  }
-
-  return false;
-}
-
-function buildHealthEmbed(currentStatus, result, previousStatus) {
-  let title, color;
-
-  if (currentStatus === "up" && previousStatus !== "up") {
-    title = "✅ VRChat API 復旧";
-    color = 0x2ecc71;
-  } else if (currentStatus === "degraded") {
-    title = "⚠️ VRChat API レスポンス遅延";
-    color = 0xf1c40f;
-  } else {
-    title = "🚨 VRChat API ダウン検知";
-    color = 0xe74c3c;
-  }
-
-  const fields = [];
-
-  if (result.statusCode !== null) {
-    fields.push({ name: "ステータスコード", value: `HTTP ${result.statusCode}`, inline: true });
-  } else {
-    fields.push({ name: "エラー種別", value: result.error, inline: true });
-  }
-
-  fields.push({ name: "レスポンス時間", value: `${result.responseMs}ms`, inline: true });
-  fields.push({ name: "検知方法", value: "直接監視 (1分毎)", inline: true });
-
-  let description;
-  if (currentStatus === "up") {
-    description = "VRChat API が正常に応答しています。";
-  } else if (currentStatus === "degraded") {
-    description = `VRChat API の応答に ${(result.responseMs / 1000).toFixed(1)} 秒かかっています。`;
-  } else if (result.error === "TIMEOUT") {
-    description = `VRChat API から ${HEALTH_CHECK_TIMEOUT_MS / 1000} 秒以内に応答がありませんでした。`;
-  } else if (result.error) {
-    description = `VRChat API への接続に失敗しました (${result.error})。`;
-  } else {
-    description = `VRChat API がエラーを返しています (HTTP ${result.statusCode})。`;
-  }
-
-  return {
-    title,
-    description,
-    color,
-    fields,
-    url: "https://status.vrchat.com",
-    footer: { text: "VRChat Status Monitor (直接監視)" },
-    timestamp: new Date().toISOString(),
-  };
-}
-
-// --- Statuspage Webhook 用 (既存) ---
-
-function buildStatusPageEmbed(payload) {
+async function buildStatusPageEmbed(payload, env) {
   const incident = payload.incident || payload;
 
   if (!incident || !incident.name) {
@@ -190,52 +218,83 @@ function buildStatusPageEmbed(payload) {
   const status = incident.status || "unknown";
   const impact = incident.impact || "none";
 
-  const IMPACT_COLORS = {
-    none: 0x2ecc71,
-    minor: 0xf1c40f,
-    major: 0xe67e22,
-    critical: 0xe74c3c,
-  };
-
-  const STATUS_LABELS = {
-    investigating: "調査中",
-    identified: "原因特定",
-    monitoring: "経過観察中",
-    resolved: "解決済み",
-    postmortem: "事後分析",
-  };
-
   let title;
   let color = IMPACT_COLORS[impact] || 0x95a5a6;
 
   if (status === "resolved") {
     title = `✅ 復旧: ${incident.name}`;
     color = 0x2ecc71;
+  } else if (status === "completed") {
+    title = `✅ メンテナンス完了: ${incident.name}`;
+    color = 0x2ecc71;
+  } else if (status === "scheduled") {
+    title = `🔧 メンテナンス予定: ${incident.name}`;
+    color = 0x3498db;
+  } else if (status === "in_progress") {
+    title = `🔧 メンテナンス実施中: ${incident.name}`;
+    color = 0x3498db;
+  } else if (status === "verifying") {
+    title = `🔧 メンテナンス完了確認中: ${incident.name}`;
+    color = 0x3498db;
   } else if (incident.new_status === "investigating" || status === "investigating") {
     title = `🚨 新規障害: ${incident.name}`;
   } else {
     title = `🔄 状態更新: ${incident.name}`;
   }
 
-  const statusLabel = STATUS_LABELS[status] || status;
-
   const updates = incident.incident_updates || [];
-  const latestBody = updates.length > 0 ? updates[0].body : "";
+  const latestUpdate = updates.length > 0 ? updates[0] : null;
+  const latestBody = latestUpdate ? latestUpdate.body : "";
+
+  let description = (await translateBody(latestBody, env)) || "詳細情報なし";
+  if (description.length > 2000) {
+    description = description.slice(0, 2000) + "...";
+  }
 
   const fields = [
-    { name: "ステータス", value: statusLabel, inline: true },
-    { name: "影響度", value: impact, inline: true },
+    { name: "ステータス", value: STATUS_LABELS[status] || status, inline: true },
+    { name: "影響度", value: IMPACT_LABELS[impact] || impact, inline: true },
   ];
 
   const affectedComponents = incident.components || [];
   if (affectedComponents.length > 0) {
-    const names = affectedComponents.map((c) => c.name).join("\n");
+    const names = affectedComponents
+      .map((c) => {
+        const nameJa = COMPONENT_NAME_LABELS[c.name] || c.name;
+        const statusJa = c.status ? COMPONENT_STATUS_LABELS[c.status] || c.status : "";
+        return statusJa ? `${nameJa} - ${statusJa}` : nameJa;
+      })
+      .join("\n");
     fields.push({ name: "影響コンポーネント", value: names, inline: false });
   }
 
+  const timeSource = latestUpdate?.created_at || incident.updated_at;
+  if (timeSource) {
+    const unix = Math.floor(Date.parse(timeSource) / 1000);
+    if (Number.isFinite(unix)) {
+      // Discord タイムスタンプ記法: 閲覧者のタイムゾーン(JST等)・言語で自動表示
+      fields.push({ name: "更新時刻", value: `<t:${unix}:f> (<t:${unix}:R>)`, inline: false });
+    }
+  }
+
+  const originalLines = [`**${incident.name}**`, `Status: ${status} / Impact: ${impact}`];
+  if (latestBody) {
+    originalLines.push(
+      latestBody
+        .split("\n")
+        .map((line) => `> ${line}`)
+        .join("\n")
+    );
+  }
+  let original = originalLines.join("\n");
+  if (original.length > 1024) {
+    original = original.slice(0, 1021) + "...";
+  }
+  fields.push({ name: "以下原文", value: original, inline: false });
+
   return {
     title,
-    description: latestBody || "詳細情報なし",
+    description,
     color,
     fields,
     url: incident.shortlink || "https://status.vrchat.com",
@@ -243,6 +302,9 @@ function buildStatusPageEmbed(payload) {
     timestamp: incident.updated_at || new Date().toISOString(),
   };
 }
+
+// テスト用エクスポート
+export { buildStatusPageEmbed, translateBody };
 
 // --- 共通ユーティリティ ---
 

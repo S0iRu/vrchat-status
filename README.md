@@ -4,7 +4,9 @@ VRChat のステータスを監視し、障害の発生・更新・復旧を Dis
 2系統の監視方式で運用しています。
 
 1. **Statuspage ポーリング（GitHub Actions）** — VRChat 公式 Statuspage API を5分毎にチェックし、インシデントの差分を検知
-2. **VRChat API 直接監視（Cloudflare Worker）** — VRChat API エンドポイントを1分毎にヘルスチェックし、ダウンや遅延を即時検知。加えて Statuspage Webhook の受信にも対応
+2. **Statuspage Webhook 受信（Cloudflare Worker）** — Statuspage からの Webhook を受信し、日本語化して Discord に即時転送
+
+このほか、VRChat API を直接ヘルスチェックする Worker（`worker/health-monitor.js`）もありますが、現在は停止中です。
 
 ## プロジェクト構成
 
@@ -19,8 +21,8 @@ VRChat のステータスを監視し、障害の発生・更新・復旧を Dis
 │   └── notifiers/
 │       └── discord.py               # Discord Webhook 通知
 ├── worker/
-│   ├── index.js                     # CF Worker: Webhook受信 + ヘルスチェック
-│   └── health-monitor.js            # CF Worker: ヘルスチェック専用（ヒステリシス付き）
+│   ├── index.js                     # CF Worker: Statuspage Webhook受信（日本語化してDiscord転送）
+│   └── health-monitor.js            # CF Worker: ヘルスチェック専用（ヒステリシス付き・現在停止中）
 └── .github/
     └── workflows/
         └── check_status.yml         # GitHub Actions ワークフロー
@@ -49,14 +51,18 @@ VRChat のステータスを監視し、障害の発生・更新・復旧を Dis
 
 #### `worker/index.js`
 
-2つの機能を持つ Worker です。
+Statuspage Webhook 受信専用の Worker です。HTTP POST で Statuspage からの Webhook を受け取り、Discord Embed に変換して転送します。
 
-- **Statuspage Webhook 受信**: HTTP POST で Statuspage からの Webhook を受け取り、Discord Embed に変換して転送
-- **VRChat API ヘルスチェック**: Cron Trigger で `https://api.vrchat.cloud/api/1/config` を定期的に ping し、ダウン・レスポンス遅延（5秒超）を検知。KV で前回状態を管理
+Webhook 通知は以下の日本語化処理を行います。
 
-#### `worker/health-monitor.js`
+- **本文の日本語化**: Statuspage の定型文・VRChat の常用フレーズは内蔵辞書で翻訳。辞書に無いカスタム文は Workers AI（`@cf/google/gemma-3-12b-it`）で機械翻訳し、末尾に「（自動機械翻訳）」を付記。AI が未設定・失敗時は英語原文をそのまま表示
+- **ラベルの日本語化**: ステータス・影響度・コンポーネント名・コンポーネント状態・リージョン名を日本語表示（未知の値は英語のまま表示）
+- **更新時刻**: Discord タイムスタンプ記法（`<t:...:f>` / `<t:...:R>`）で表示。閲覧者のタイムゾーン（日本なら JST）・言語で自動表示され、相対表示（「○分前」）は自動更新される
+- **原文の併記**: embed 末尾の「以下原文」フィールドに英語のインシデント名・ステータス・本文をまとめて表示
 
-ヘルスチェック専用の Worker です。`index.js` と同じ VRChat API を監視しますが、誤報を抑制するヒステリシス機構を備えています。
+#### `worker/health-monitor.js`（現在停止中）
+
+ヘルスチェック専用の Worker です。Cron Trigger で `https://api.vrchat.cloud/api/1/config` を定期的に ping し、ダウン・レスポンス遅延（5秒超）を検知します。誤報を抑制するヒステリシス機構を備え、状態管理に KV を使用します。
 
 - 連続2回失敗で「ダウン」通知
 - 連続3回成功で「復旧」通知
@@ -68,9 +74,9 @@ VRChat のステータスを監視し、障害の発生・更新・復旧を Dis
 - **新規障害** — インシデント名、ステータス、影響度、影響コンポーネント
 - **状態更新** — ステータス変化の通知
 - **復旧** — インシデント解決の通知
-- **API ダウン検知** — VRChat API の接続失敗・HTTP エラー（Worker による直接監視）
-- **API レスポンス遅延** — 応答が5秒を超えた場合（Worker による直接監視）
-- **API 復旧** — ダウンまたは遅延状態からの復帰（Worker による直接監視）
+- **API ダウン検知** — VRChat API の接続失敗・HTTP エラー（health-monitor.js 稼働時のみ・現在停止中）
+- **API レスポンス遅延** — 応答が5秒を超えた場合（health-monitor.js 稼働時のみ・現在停止中）
+- **API 復旧** — ダウンまたは遅延状態からの復帰（health-monitor.js 稼働時のみ・現在停止中）
 
 ## セットアップ
 
@@ -105,21 +111,18 @@ VRChat のステータスを監視し、障害の発生・更新・復旧を Dis
 npx wrangler deploy worker/index.js
 ```
 
-#### 2. KV Namespace の作成
-
-ヘルスチェックの状態管理用に KV Namespace を作成し、Worker にバインドします。
-
-```bash
-npx wrangler kv namespace create "KV"
-```
-
-#### 3. 環境変数の設定
+#### 2. 環境変数の設定
 
 Cloudflare ダッシュボードまたは `wrangler.toml` で `DISCORD_WEBHOOK_URL` を設定してください。
 
-#### 4. Cron Trigger の設定
+#### 3. Workers AI バインディングの設定（任意・本文の機械翻訳用）
 
-Cloudflare ダッシュボードで Cron Trigger を設定します（例: `* * * * *` で1分毎）。
+辞書に無いカスタム文を日本語に機械翻訳する場合は、Workers AI のバインディングを追加します。
+
+1. Cloudflare ダッシュボード → 対象 Worker → Settings → Bindings
+2. 「Add」→「Workers AI」を選択し、変数名を `AI` に設定
+
+未設定でも動作します（その場合、辞書に無い文は英語のまま表示）。Workers AI は無料プランでも1日 10,000 ニューロンの無料枠があり、本用途では十分です。無料枠超過時は課金されずリクエストが拒否され、英語原文表示にフォールバックします。
 
 ## ローカル実行
 
@@ -153,7 +156,8 @@ python main.py
 | バインディング | 用途 |
 |---------------|------|
 | `DISCORD_WEBHOOK_URL` | Discord Webhook URL |
-| `KV` | ヘルスチェック状態の永続化 |
+| `AI` | Workers AI（任意。辞書に無い本文の機械翻訳用） |
+| `KV` | ヘルスチェック状態の永続化（health-monitor.js 使用時のみ） |
 
 ## 今後の拡張予定
 
