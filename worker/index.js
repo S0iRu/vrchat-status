@@ -24,6 +24,8 @@ export default {
 
 // --- Statuspage Webhook 用 ---
 
+const TRANSLATION_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+
 const IMPACT_COLORS = {
   none: 0x2ecc71,
   minor: 0xf1c40f,
@@ -170,11 +172,24 @@ function translateParagraph(paragraph) {
   return null;
 }
 
+function cleanTranslationOutput(raw) {
+  let output = raw.trim();
+  // reasoning 系モデルの思考ブロック除去
+  output = output.replace(/<think>[\s\S]*?<\/think>/gi, "");
+  output = output.replace(/<think>[\s\S]*?<\/redacted_thinking>/gi, "");
+  output = output.trim();
+  // 前置き除去
+  output = output.replace(/^(?:Translation|Japanese translation|日本語訳|訳文)\s*[:：]\s*/i, "");
+  // 前後の引用符・括弧除去
+  output = output.replace(/^["'「『]+|["'」』]+$/g, "").trim();
+  return output;
+}
+
 async function translateWithAI(text, env) {
   if (!env || !env.AI) return null;
 
   try {
-    const result = await env.AI.run("@cf/google/gemma-3-12b-it", {
+    const result = await env.AI.run(TRANSLATION_MODEL, {
       messages: [
         {
           role: "system",
@@ -186,10 +201,16 @@ async function translateWithAI(text, env) {
       max_tokens: 1024,
     });
 
-    const output = (result?.response || "").trim();
-    if (!output) return null;
+    const output = cleanTranslationOutput(result?.response || "");
+    if (!output) {
+      console.error("AI translation empty output");
+      return null;
+    }
     // 異常出力ガード(翻訳として長すぎる場合は採用しない)
-    if (output.length > text.length * 3 + 100) return null;
+    if (output.length > text.length * 3 + 100) {
+      console.error("AI translation too long:", output.length);
+      return null;
+    }
     return output;
   } catch (err) {
     console.error("AI translation error:", err);
