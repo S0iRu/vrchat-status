@@ -55,7 +55,7 @@ Statuspage Webhook 受信専用の Worker です。HTTP POST で Statuspage か�
 
 Webhook 通知は以下の日本語化処理を行います。
 
-- **本文の日本語化**: Statuspage の定型文・VRChat の常用フレーズは内蔵辞書で翻訳。辞書に無いカスタム文は Workers AI（`@cf/meta/llama-3.3-70b-instruct-fp8-fast`）で機械翻訳し、末尾に「（自動機械翻訳）」を付記。AI が未設定・失敗時は英語原文をそのまま表示
+- **本文の日本語化**: Statuspage の定型文・VRChat の常用フレーズは内蔵辞書で翻訳。辞書に無いカスタム文は Workers AI（`@cf/meta/llama-3.3-70b-instruct-fp8-fast`）で機械翻訳し、末尾に「（AI翻訳）」を付記。AI が未設定・失敗時は英語原文をそのまま表示
 - **ラベルの日本語化**: ステータス・影響度・コンポーネント名・コンポーネント状態・リージョン名を日本語表示（未知の値は英語のまま表示）
 - **メンテナンス予定時間**: メンテナンス通知では開始〜終了の時間帯を Discord タイムスタンプ記法（`<t:...:f>` / `<t:...:R>`）で表示。閲覧者のタイムゾーン（日本なら JST）・言語で自動表示され、相対表示（「○時間後」等）は自動更新される
 - **原文の併記**: embed 末尾の「以下原文」フィールドに英語のインシデント名・ステータス・本文をまとめて表示
@@ -115,7 +115,32 @@ npx wrangler deploy worker/index.js
 
 Cloudflare ダッシュボードまたは `wrangler.toml` で `DISCORD_WEBHOOK_URL` を設定してください。
 
-#### 3. Workers AI バインディングの設定（任意・本文の機械翻訳用）
+#### 3. シークレットパスの設定（推奨・偽装 POST 対策）
+
+Worker の URL は認証なしで POST を受け付けるため、URL を知っていれば誰でも偽の通知を送れてしまいます。`WEBHOOK_SECRET` を設定すると、`/hook/<シークレット>` への POST のみ受け付けるようになります（それ以外は 404）。
+
+1. ランダムな文字列を生成する
+
+```powershell
+-join ((48..57) + (97..122) | Get-Random -Count 48 | ForEach-Object { [char]$_ })
+```
+
+2. Cloudflare にシークレットとして登録する
+
+```bash
+npx wrangler secret put WEBHOOK_SECRET
+```
+
+（またはダッシュボード → 対象 Worker → Settings → Variables and Secrets で `WEBHOOK_SECRET` を追加）
+
+3. Statuspage の Webhook 購読を新しい URL で登録し直す
+
+   1. 過去に届いた Webhook の `meta.unsubscribe` リンク、または [status.vrchat.com](https://status.vrchat.com/) の Subscribe メニューから既存の購読を解除
+   2. `https://<worker名>.<サブドメイン>.workers.dev/hook/<シークレット>` で再購読
+
+`WEBHOOK_SECRET` 未設定の場合は従来どおり全パスで受け付けます（後方互換）。
+
+#### 4. Workers AI バインディングの設定（任意・本文の機械翻訳用）
 
 辞書に無いカスタム文を日本語に機械翻訳する場合は、Workers AI のバインディングを追加します。
 
@@ -156,6 +181,7 @@ python main.py
 | バインディング | 用途 |
 |---------------|------|
 | `DISCORD_WEBHOOK_URL` | Discord Webhook URL |
+| `WEBHOOK_SECRET` | 受信パスのシークレット（推奨。設定時は `/hook/<シークレット>` のみ受け付け） |
 | `AI` | Workers AI（任意。辞書に無い本文の機械翻訳用） |
 | `KV` | ヘルスチェック状態の永続化（health-monitor.js 使用時のみ） |
 

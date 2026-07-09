@@ -4,6 +4,15 @@ export default {
       return new Response("VRChat Status Webhook Receiver", { status: 200 });
     }
 
+    // WEBHOOK_SECRET 設定時は /hook/<シークレット> への POST のみ受け付ける(偽装POST対策)
+    // 未設定の場合は従来どおり全パスで受け付ける(設定前のデプロイでも通知が止まらないように)
+    if (env.WEBHOOK_SECRET) {
+      const { pathname } = new URL(request.url);
+      if (pathname !== `/hook/${env.WEBHOOK_SECRET}`) {
+        return new Response("Not found", { status: 404 });
+      }
+    }
+
     try {
       const payload = await request.json();
       const embed = await buildStatusPageEmbed(payload, env);
@@ -106,6 +115,9 @@ const BODY_PHRASES = [
   ["This incident has been resolved.", "この障害は解決されました。"],
   // Statuspage 標準(メンテナンス系)
   ["We will be undergoing scheduled maintenance during this time.", "この時間帯に定期メンテナンスを実施します。"],
+  ["We will be undergoing scheduled maintenance at this time.", "この時間帯に定期メンテナンスを実施予定です。"],
+  ["We will be undergoing scheduled maintenance at this time. All systems will still be operational during this maintenance.", "この時間帯に定期メンテナンスを実施予定です。メンテナンス中もすべてのシステムは通常どおり稼働します。"],
+  ["All systems will still be operational during this maintenance.", "メンテナンス中もすべてのシステムは通常どおり稼働します。"],
   ["Scheduled maintenance is currently in progress. We will provide updates as necessary.", "定期メンテナンスを実施中です。必要に応じて更新情報をお知らせします。"],
   ["We are verifying that the maintenance was completed successfully.", "メンテナンスが正常に完了したことを確認しています。"],
   ["The scheduled maintenance has been completed.", "定期メンテナンスは完了しました。"],
@@ -219,7 +231,7 @@ async function translateWithAI(text, env) {
 }
 
 // 本文の日本語化: 全段落が辞書・テンプレートに一致すれば辞書訳、
-// 一致しなければ AI 翻訳(末尾に「(自動機械翻訳)」)、それも不可なら英語原文
+// 一致しなければ AI 翻訳(末尾に「(AI翻訳)」)、それも不可なら英語原文
 async function translateBody(body, env) {
   if (!body) return "";
 
@@ -231,7 +243,7 @@ async function translateBody(body, env) {
   }
 
   const ai = await translateWithAI(body, env);
-  if (ai) return `${ai}(自動機械翻訳)`;
+  if (ai) return `${ai}(AI翻訳)`;
 
   return body;
 }
