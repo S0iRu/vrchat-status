@@ -33,7 +33,8 @@ export default {
 
 // --- Statuspage Webhook 用 ---
 
-const TRANSLATION_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+// const TRANSLATION_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+const TRANSLATION_MODEL = "@cf/qwen/qwen3.8-27b";
 
 const IMPACT_COLORS = {
   none: 0x2ecc71,
@@ -211,9 +212,15 @@ async function translateWithAI(text, env) {
         { role: "user", content: text },
       ],
       max_tokens: 1024,
+      max_completion_tokens: 1024,
+      reasoning_effort: "low",
     });
 
-    const output = cleanTranslationOutput(result?.response || "");
+    const content = result?.choices?.[0]?.message?.content;
+    const raw =
+      (typeof content === "string" && content.trim() ? content : "") ||
+      (typeof result?.response === "string" ? result.response : "");
+    const output = cleanTranslationOutput(raw);
     if (!output) {
       console.error("AI translation empty output");
       return null;
