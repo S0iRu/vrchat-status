@@ -122,6 +122,7 @@ const BODY_PHRASES = [
   ["Scheduled maintenance is currently in progress. We will provide updates as necessary.", "定期メンテナンスを実施中です。必要に応じて更新情報をお知らせします。"],
   ["We are verifying that the maintenance was completed successfully.", "メンテナンスが正常に完了したことを確認しています。"],
   ["The scheduled maintenance has been completed.", "定期メンテナンスは完了しました。"],
+  ["This aims to improve server stability and scalability.", "サーバーの安定性とスケーラビリティの向上を目的としています。"],
   // VRChat 常用フレーズ
   ["We're observing logins return to normal levels", "ログインが通常水準に戻りつつあることを確認しています。"],
   ["We're seeing api errors and latency returning to normal levels. We'll continue to monitor to ensure things remain stable.", "APIのエラーとレイテンシが通常水準に戻りつつあります。安定が続くか引き続き監視します。"],
@@ -182,7 +183,37 @@ function translateParagraph(paragraph) {
     return "上流プロバイダーのネットワーク接続問題により、インスタンスでタイムアウトやパフォーマンス低下が発生する可能性があります。";
   }
 
+  // 段落全体で一致しない場合は文単位で照合(全文が辞書にあれば連結して返す)
+  const sentences = collapsed.split(/(?<=[.!?])\s+/);
+  if (sentences.length > 1) {
+    const hits = sentences.map((s) => BODY_PHRASE_MAP.get(normalizeText(s)));
+    if (hits.every(Boolean)) return hits.join("");
+  }
+
   return null;
+}
+
+// AI 翻訳用の文脈(ステータス・予定時刻)。時制の誤訳を防ぐために system プロンプトへ追記する
+function buildTranslationContext(context) {
+  const lines = [
+    "The text is an update posted on the VRChat status page.",
+    "Preserve the tense of the original: never render a future or planned event as something happening now.",
+  ];
+  if (!context) return lines.join("\n");
+
+  if (context.name) lines.push(`Incident title: ${context.name}`);
+  if (context.status) lines.push(`Incident status: ${context.status}`);
+  if (context.status === "scheduled") {
+    let schedule = "The maintenance has NOT started yet.";
+    if (context.scheduledFor) {
+      const until = context.scheduledUntil ? ` to ${formatUtc(context.scheduledUntil)}` : "";
+      schedule += ` It is scheduled for ${formatUtc(context.scheduledFor)}${until} UTC; the current time is ${formatUtc(new Date().toISOString())} UTC.`;
+    }
+    lines.push(
+      `${schedule} Phrases such as "at this time" or "during this time" refer to the scheduled window, not to now. Translate it as a future plan (e.g. 実施予定です), not as ongoing work.`
+    );
+  }
+  return lines.join("\n");
 }
 
 function cleanTranslationOutput(raw) {
@@ -198,7 +229,7 @@ function cleanTranslationOutput(raw) {
   return output;
 }
 
-async function translateWithAI(text, env) {
+async function translateWithAI(text, env, context) {
   if (!env || !env.AI) return null;
 
   try {
@@ -207,7 +238,8 @@ async function translateWithAI(text, env) {
         {
           role: "system",
           content:
-            "You are a professional translator. Translate the user's text from English to natural Japanese. Output only the Japanese translation, with no explanations, notes, or quotation marks.",
+            "You are a professional translator. Translate the user's text from English to natural Japanese. Output only the Japanese translation, with no explanations, notes, or quotation marks.\n\n" +
+            buildTranslationContext(context),
         },
         { role: "user", content: text },
       ],
@@ -239,7 +271,7 @@ async function translateWithAI(text, env) {
 
 // 本文の日本語化: 全段落が辞書・テンプレートに一致すれば辞書訳、
 // 一致しなければ AI 翻訳(末尾に「(AI翻訳)」)、それも不可なら英語原文
-async function translateBody(body, env) {
+async function translateBody(body, env, context) {
   if (!body) return "";
 
   const paragraphs = body.trim().split(/\n\s*\n/);
@@ -249,7 +281,7 @@ async function translateBody(body, env) {
     return translated.join("\n\n");
   }
 
-  const ai = await translateWithAI(body, env);
+  const ai = await translateWithAI(body, env, context);
   if (ai) return `${ai}(AI翻訳)`;
 
   return body;
@@ -293,7 +325,13 @@ async function buildStatusPageEmbed(payload, env) {
   const latestUpdate = updates.length > 0 ? updates[0] : null;
   const latestBody = latestUpdate ? latestUpdate.body : "";
 
-  let description = (await translateBody(latestBody, env)) || "詳細情報なし";
+  const translationContext = {
+    name: incident.name,
+    status,
+    scheduledFor: incident.scheduled_for,
+    scheduledUntil: incident.scheduled_until,
+  };
+  let description = (await translateBody(latestBody, env, translationContext)) || "詳細情報なし";
   if (description.length > 2000) {
     description = description.slice(0, 2000) + "...";
   }
