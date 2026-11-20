@@ -12,18 +12,18 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
-          python-version: '3.11'
+          python-version: '3.15'
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Restore state
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: state.json
           key: vrchat-status-state
@@ -35,7 +35,7 @@ jobs:
         run: python main.py
 
       - name: Save state
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: state.json
           key: vrchat-status-state
